@@ -69,21 +69,26 @@ static u32_t sample_rates[] = {
 static u32_t sample_rate;
 static u32_t sample_size;
 static u32_t channels;
+static u32_t codec = 1;
 static bool  bigendian;
-static bool  limit;
+static bool  limit = false;
 static u32_t audio_left;
 static u32_t bytes_per_frame;
+int total_bytes = 0;
 
 typedef enum { UNKNOWN = 0, WAVE, AIFF } header_format;
 
 static void _check_header(void) {
 	u8_t *ptr = streambuf->readp;
 	unsigned bytes = min(_buf_used(streambuf), _buf_cont_read(streambuf));
+	
+	LOG_INFO("Streambuf: %u | Cont read: %u", _buf_used(streambuf), _buf_cont_read(streambuf));
 	header_format format = UNKNOWN;
 
 	// simple parsing of wav and aiff headers and get to samples
 
 	if (bytes > 12) {
+		LOG_INFO("CHECKING FORMAT %s", ptr);
 		if (!memcmp(ptr, "RIFF", 4) && !memcmp(ptr+8, "WAVE", 4)) {
 			LOG_INFO("WAVE");
 			format = WAVE;
@@ -110,7 +115,17 @@ static void _check_header(void) {
 			}
 				
 			LOG_INFO("header: %s len: %d", id, len);
-
+			if (format == WAVE && id[0] == '\0') {
+				LOG_INFO("Found bad header tag, trying to read ahead");
+                        	if (bytes >= 1 + 8) {
+                                	ptr   += 1;
+                                	bytes -= 1;
+	                        } else {
+        	                        LOG_WARN("run out of data");
+                	                return;
+                        	}
+				continue;	
+			}
 			if (format == WAVE && !memcmp(ptr, "data", 4)) {
 				ptr += 8;
 				_buf_inc_readp(streambuf, ptr - streambuf->readp);
@@ -120,7 +135,7 @@ static void _check_header(void) {
 					LOG_INFO("wav audio size unknown: %u", audio_left);
 					limit = false;
 				} else {
-					LOG_INFO("wav audio size: %u", audio_left);
+					LOG_INFO("wav audio size: %u | limiting to it", audio_left);
 					limit = true;
 				}
 				return;
@@ -147,8 +162,27 @@ static void _check_header(void) {
 				channels    = *(ptr+10) | *(ptr+11) << 8;
 				sample_rate = *(ptr+12) | *(ptr+13) << 8 | *(ptr+14) << 16 | *(ptr+15) << 24;
 				sample_size = (*(ptr+22) | *(ptr+23) << 8) / 8;
-				bigendian   = 0;
-				LOG_INFO("pcm size: %u rate: %u chan: %u bigendian: %u", sample_size, sample_rate, channels, bigendian);
+				// ToDo: find proper way of getting endianess
+				//bigendian   = 0;
+				codec	    = *(ptr+8) | *(ptr+9) << 8;
+				LOG_INFO("pcm size: %u rate: %u chan: %u bigendian: %u codec: %u", sample_size, sample_rate, channels, bigendian, codec);
+				/*ptr += 23;
+				while (memcmp(ptr, "data", 4)) {
+					ptr +=1 ;
+				}
+				LOG_INFO("Found DATA value");
+				ptr += 8;
+                                _buf_inc_readp(streambuf, ptr - streambuf->readp);
+                                //audio_left = len;
+
+                                if ((audio_left == 0xFFFFFFFF) || (audio_left == 0x7FFFEFFC)) {
+                                        LOG_INFO("wav audio size unknown: %u", audio_left);
+                                        limit = false;
+                                } else {
+                                        LOG_INFO("wav audio size: %u", audio_left);
+                                        limit = false;
+                                }
+                                return;*/
 			}
 
 			if (format == AIFF && !memcmp(ptr, "COMM", 4) && bytes >= 26) {
@@ -156,7 +190,8 @@ static void _check_header(void) {
 				// override the server parsed values with our own
 				channels    = *(ptr+8) << 8 | *(ptr+9);
 				sample_size = (*(ptr+14) << 8 | *(ptr+15)) / 8;
-				bigendian   = 1;
+				// ToDo: find proper way of getting endianess
+				//bigendian   = 1;
 				// sample rate is encoded as IEEE 80 bit extended format
 				// make some assumptions to simplify processing - only use first 32 bits of mantissa
 				exponent = ((*(ptr+16) & 0x7f) << 8 | *(ptr+17)) - 16383 - 31;
@@ -186,17 +221,23 @@ static decode_state pcm_decode(void) {
 	OPTR_T *optr;
 	u8_t  *iptr;
 	u8_t tmp[3*8];
+	OPTR_T tmp_in;
+	float  tmp_float;
 	
 	LOCK_S;
 
-	if ( decode.new_stream && ( ( stream.state == STREAMING_FILE ) || pcm_check_header ) ) {
+	if (decode.new_stream /*&& ( ( stream.state == STREAMING_FILE ) || pcm_check_header )*/ ) {
 		_check_header();
 	}
 
 	LOCK_O_direct;
 
-	bytes = min(_buf_used(streambuf), _buf_cont_read(streambuf));
-
+//	bytes = min(_buf_used(streambuf), _buf_cont_read(streambuf));
+	bytes = _buf_used(streambuf);
+	
+	
+	LOG_DEBUG("Stream buf used: %d | Stream buf cont read: %d", _buf_used(streambuf), _buf_cont_read(streambuf));
+	
 	IF_DIRECT(
 		out = min(_buf_space(outputbuf), _buf_cont_write(outputbuf)) / BYTES_PER_FRAME;
 	);
@@ -205,10 +246,13 @@ static decode_state pcm_decode(void) {
 	);
 
 	if ((stream.state <= DISCONNECT && bytes < bytes_per_frame) || (limit && audio_left == 0)) {
+		LOG_INFO("Decoded %d bytes", total_bytes);
 		UNLOCK_O_direct;
 		UNLOCK_S;
 		return DECODE_COMPLETE;
 	}
+
+	bytes = min(_buf_used(streambuf), _buf_cont_read(streambuf));
 
 	if (decode.new_stream) {
 		LOG_INFO("setting track_start");
@@ -252,7 +296,7 @@ static decode_state pcm_decode(void) {
 	iptr = (u8_t *)streambuf->readp;
 
 	in = bytes / bytes_per_frame;
-
+	total_bytes += bytes;
 	//  handle frame wrapping round end of streambuf
 	//  - only need if resizing of streambuf does not avoid this, could occur in localfile case
 	if (in == 0 && bytes > 0 && _buf_used(streambuf) >= bytes_per_frame) {
@@ -334,7 +378,14 @@ static decode_state pcm_decode(void) {
 #if BYTES_PER_FRAME == 4																			
 					*optr++ = *(iptr+2) | *(iptr+3) << 8;
 #else
-					*optr++ = *(iptr) | *(iptr+1) << 8 | *(iptr+2) << 16 | *(iptr+3) << 24;
+					{
+					tmp_in = *(iptr) | *(iptr+1) << 8 | *(iptr+2) << 16 | *(iptr+3) << 24;
+					tmp_float = *(float *)&tmp_in;
+					if (codec == 3)
+						*optr++ = (OPTR_T)(tmp_float * 2147483648);
+					else
+						*optr++ = tmp_in;
+					}
 #endif	
 					iptr += 4;
 				}
@@ -438,6 +489,7 @@ static decode_state pcm_decode(void) {
 }
 
 static void pcm_open(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
+
 	sample_size = size - '0' + 1;
 	sample_rate = sample_rates[rate - '0'];
 	channels    = chan - '0';
@@ -472,7 +524,7 @@ struct codec *register_pcm(void) {
 	{
 		static struct codec ret = { 
 			'p',         // id
-			"aif,pcm", // types
+			"wav,aif,pcm", // types
 			4096,        // min read
 			102400,      // min space
 			pcm_open,    // open

@@ -115,7 +115,7 @@ static void _check_header(void) {
 			}
 				
 			LOG_INFO("header: %s len: %d", id, len);
-			if (/*format == WAVE && */id[0] == '\0') {
+			if (id[0] == '\0') {
 				LOG_INFO("Found bad header tag, trying to read ahead");
                         	if (bytes >= 1 + 8) {
                                 	ptr   += 1;
